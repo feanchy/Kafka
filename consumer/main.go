@@ -2,95 +2,87 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
-	"sync"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/segmentio/kafka-go"
 )
 
-type Job struct {
-	Message kafka.Message
+const (
+	brokerAddr = "localhost:9092"
+	topic      = "orders"
+	groupID    = "orders-consumer-group"
+)
+
+type order struct {
+	ID        int     `json:"id"`
+	Status    string  `json:"status"`
+	CreatedAt string  `json:"created_at"`
+	Amount    float64 `json:"amount"`
 }
 
 func main() {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 
 	reader := kafka.NewReader(kafka.ReaderConfig{
-		Brokers: []string{"localhost:9092"},
-		Topic:   "orders",
-		GroupID: "orders-consumer-group",
+		Brokers:        []string{brokerAddr},
+		Topic:          topic,
+		GroupID:        groupID,
+		StartOffset:    kafka.FirstOffset,
+		MaxWait:        2 * time.Second,
+		CommitInterval: time.Second,
 	})
-
 	defer reader.Close()
 
-	jobs := make(chan Job)
-
-	var wg sync.WaitGroup
-
-	// 3 workers
-	for i := 1; i <= 3; i++ {
-		wg.Add(1)
-		go worker(i, jobs, reader, ctx, &wg)
-	}
-
-	// Consumer
 	for {
+		select {
+		case <-ctx.Done():
+			log.Println("consumer stopped")
+			return
+		default:
+		}
+
 		message, err := reader.FetchMessage(ctx)
 		if err != nil {
-			log.Fatal(err)
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				return
+			}
+			log.Printf("fetch error: %v", err)
+			time.Sleep(time.Second)
+			continue
 		}
 
-		jobs <- Job{
-			Message: message,
+		var payload order
+		if err := json.Unmarshal(message.Value, &payload); err != nil {
+			log.Printf("invalid payload partition=%d offset=%d: %v", message.Partition, message.Offset, err)
+			if commitErr := reader.CommitMessages(ctx, message); commitErr != nil {
+				log.Printf("commit invalid payload failed: %v", commitErr)
+			}
+			continue
 		}
-	}
 
-	close(jobs)
-	wg.Wait()
-
-}
-
-func worker(
-	id int,
-	jobs <-chan Job,
-	reader *kafka.Reader,
-	ctx context.Context,
-	wg *sync.WaitGroup,
-
-) {
-	defer wg.Done()
-
-	for job := range jobs {
-		message := job.Message
-
-		fmt.Printf(
-			"worker=%d partition=%d offset=%d value=%s\n",
-			id,
+		fmt.Printf("worker=1 partition=%d offset=%d order=%d status=%s amount=%.2f\n",
 			message.Partition,
 			message.Offset,
-			string(message.Value),
+			payload.ID,
+			payload.Status,
+			payload.Amount,
 		)
 
 		time.Sleep(2 * time.Second)
 
-		err := reader.CommitMessages(ctx, message)
-		if err != nil {
-			log.Printf(
-				"worker=%d commit error: %v\n",
-				id,
-				err,
-			)
+		if err := reader.CommitMessages(ctx, message); err != nil {
+			log.Printf("commit error for partition=%d offset=%d: %v", message.Partition, message.Offset, err)
 			continue
 		}
 
-		fmt.Printf(
-			"worker=%d committed partition=%d offset=%d\n",
-			id,
-			message.Partition,
-			message.Offset,
-		)
+		fmt.Printf("committed partition=%d offset=%d\n", message.Partition, message.Offset)
 	}
 }
